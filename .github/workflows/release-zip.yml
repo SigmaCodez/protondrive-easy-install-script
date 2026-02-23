@@ -1,0 +1,37 @@
+name: Build ZIP Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  zip-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare artifact
+        run: |
+          set -euo pipefail
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          TAG_NAME="${GITHUB_REF_NAME}"
+          ZIP_NAME="${REPO_NAME}-${TAG_NAME}.zip"
+
+          mkdir -p dist
+          zip -r "dist/${ZIP_NAME}" . \
+            -x ".git/*" \
+               ".github/*" \
+               "dist/*"
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "dist/${{ env.ZIP_NAME }}"
+          generate_release_notes: true
