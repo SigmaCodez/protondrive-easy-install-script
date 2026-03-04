@@ -1,53 +1,59 @@
-# rclone Proton Drive mount on login (Ubuntu / systemd --user)
+# Proton Drive: Read-only mount + local staging + auto-upload (rclone)
 
-This repository provides a simple installer that:
+This project sets up a **hybrid workflow** for Proton Drive on Ubuntu/Linux:
 
-- Installs **rclone** (official installer) and **FUSE3**
-- Creates an **rclone Proton Drive** remote
-- Creates a **systemd user service** to mount Proton Drive automatically on login
-- Keeps the mount running in the background and restarts on failure
+- **Browse Proton Drive as a filesystem** via an **rclone read-only mount**
+- **Edit/copy files locally** in a **staging folder**
+- A watcher uploads changes **automatically** using `rclone move` (so the staging area is cleaned up after a successful upload)
 
-> Note: rclone's Proton Drive backend is documented by rclone. You should have logged into Proton Drive at least once via a normal Proton client/browser so your account keys exist.
+This avoids the most common Proton Drive issues when uploading through `rclone mount` / VFS.
 
-## Tested on
-- Ubuntu (works on modern Ubuntu releases with systemd user services)
+## How it works
 
-## Quick start
+Folders created by the installer (defaults):
+
+- `~/ProtonDriveRO` — **read-only** mount of Proton Drive (browse/download)
+- `~/ProtonDriveStage` — local **staging** folder (edit/copy here)
+
+Uploads:
+- Any file you place or modify in `~/ProtonDriveStage` will be uploaded to `ProtonDrive:/StageUpload`
+- After a successful upload, files are removed from the staging folder automatically
+
+Helpers:
+- `pd-edit <remote-relative-path>` downloads a remote file into the staging folder and opens it.
+  When you save/close it, the watcher will upload it back to the remote upload path.
+
+## Install (Ubuntu)
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-After installation:
+## Services
+
+- `rclone-protondrive-ro-mount` (read-only mount)
+- `protondrive-stage-uploader` (watcher/uploader)
+
+Status / logs:
 
 ```bash
-systemctl --user status rclone-protondrive
-journalctl --user -u rclone-protondrive -f
-ls -la ~/ProtonDrive
+systemctl --user status rclone-protondrive-ro-mount protondrive-stage-uploader
+journalctl --user -u rclone-protondrive-ro-mount -f
+journalctl --user -u protondrive-stage-uploader -f
 ```
 
-## What it installs/configures
+## Notes / limitations
 
-- Mount point: `~/ProtonDrive`
-- Remote name: `ProtonDrive` (change in `install.sh` if you want)
-- systemd user unit: `~/.config/systemd/user/rclone-protondrive.service`
-
-## Uninstall / disable
-
-```bash
-systemctl --user disable --now rclone-protondrive
-rm -f ~/.config/systemd/user/rclone-protondrive.service
-systemctl --user daemon-reload
-
-# optionally delete the remote
-rclone config delete ProtonDrive
-```
-
-## Security notes
-
-- The script uses `rclone obscure` to store the password in rclone config. This is **obfuscation**, not encryption.
-- If you prefer not to store credentials, configure the remote manually (`rclone config`) and skip the remote-creation part of the script.
+- This is not a true 2-way sync engine. It is **staging → upload**.
+- Upload stability depends on the Proton Drive backend in rclone.
+- The installer enables mitigations:
+  - uploads happen via `rclone move` (not via VFS writeback)
+  - `--protondrive-replace-existing-draft=true`
+  - low concurrency (`--transfers 1 --checkers 1`)
+  - `flock` to prevent overlapping runs
+  - only uploads files that have been unchanged for a short “settle time”
 
 ## License
+
 MIT

@@ -3,76 +3,69 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# install.sh — Proton Drive "sync-on-change" setup (Option B)
+# install.sh — Proton Drive hybrid staging uploader
 #
-# Clean install on Ubuntu:
-# 1) Install dependencies (curl, unzip, fuse3, inotify-tools)
-# 2) Install rclone (official installer)
-# 3) Create rclone Proton Drive remote (type=protondrive)
-# 4) Create a local working folder (LOCAL_DIR)
-# 5) Create a systemd --user service that watches LOCAL_DIR and runs
-#    rclone sync to Proton Drive after changes (debounced)
+# - Read-only mount for browsing:   MOUNT_DIR (default ~/ProtonDriveRO)
+# - Local staging for edits/uploads STAGE_DIR (default ~/ProtonDriveStage)
+# - Watch STAGE_DIR and upload via rclone move after files "settle"
+# - Clean staging automatically after successful upload
 #
-# Notes:
-# - This is NOT a realtime sync engine; it triggers rclone sync after changes.
-# - It is "local-first": you work in LOCAL_DIR; uploads happen via rclone sync.
-# - Proton Drive backend may be unstable; this script uses a mitigation flag:
-#   --protondrive-replace-existing-draft=true
+# This avoids writing to Proton Drive via rclone mount/VFS (often unstable).
 # ------------------------------------------------------------
 
-# -----------------------------
-# Defaults (press Enter to accept)
-# -----------------------------
 DEFAULT_REMOTE_NAME="ProtonDrive"
-DEFAULT_LOCAL_DIR="${HOME}/ProtonDriveLocal"
-DEFAULT_REMOTE_PATH="ProtonDrive:/Backup"
-DEFAULT_DEBOUNCE_SECONDS="10"
+DEFAULT_MOUNT_DIR="${HOME}/ProtonDriveRO"
+DEFAULT_STAGE_DIR="${HOME}/ProtonDriveStage"
+DEFAULT_REMOTE_UPLOAD="ProtonDrive:/StageUpload"
+
+# Wait after last modification before uploading (seconds)
+DEFAULT_SETTLE_SECONDS="15"
+
+# Debounce between event storms (seconds)
+DEFAULT_DEBOUNCE_SECONDS="3"
+
+# Proton Drive stability settings
 DEFAULT_TRANSFERS="1"
 DEFAULT_CHECKERS="1"
 
-echo "==> Proton Drive sync-on-change installer (Ubuntu / systemd --user)"
+SERVICE_MOUNT="rclone-protondrive-ro-mount"
+SERVICE_UPLOADER="protondrive-stage-uploader"
+
+echo "==> Proton Drive hybrid installer: RO mount + staging uploader"
 echo
 
-# -----------------------------
-# 1) Dependencies
-# -----------------------------
-echo "==> Installing dependencies (curl, unzip, fuse3, inotify-tools)..."
+echo "==> Installing dependencies (curl, unzip, fuse3, inotify-tools, util-linux)..."
 sudo apt-get update -y
-sudo apt-get install -y curl unzip fuse3 inotify-tools
+sudo apt-get install -y curl unzip fuse3 inotify-tools util-linux
 
-# -----------------------------
-# 2) Install rclone
-# -----------------------------
+# rclone
 if command -v rclone >/dev/null 2>&1; then
   echo "==> rclone is already installed: $(rclone version | head -n 1)"
 else
   echo "==> Installing rclone (official install script)..."
   curl -fsSL https://rclone.org/install.sh | sudo bash
-  echo "==> rclone installed: $(rclone version | head -n 1)"
 fi
-
 RCLONE_BIN="$(command -v rclone)"
+echo "==> Using rclone: ${RCLONE_BIN}"
 
-# -----------------------------
-# 3) Configure remote + sync targets
-# -----------------------------
+# Paths/config
 read -rp "Remote name [${DEFAULT_REMOTE_NAME}]: " REMOTE_NAME
 REMOTE_NAME="${REMOTE_NAME:-$DEFAULT_REMOTE_NAME}"
 
-read -rp "Local working folder (edit here locally) [${DEFAULT_LOCAL_DIR}]: " LOCAL_DIR
-LOCAL_DIR="${LOCAL_DIR:-$DEFAULT_LOCAL_DIR}"
+read -rp "Read-only mount folder [${DEFAULT_MOUNT_DIR}]: " MOUNT_DIR
+MOUNT_DIR="${MOUNT_DIR:-$DEFAULT_MOUNT_DIR}"
 
-read -rp "Remote destination path [${DEFAULT_REMOTE_PATH}]: " REMOTE_PATH
-REMOTE_PATH="${REMOTE_PATH:-$DEFAULT_REMOTE_PATH}"
+read -rp "Local staging folder [${DEFAULT_STAGE_DIR}]: " STAGE_DIR
+STAGE_DIR="${STAGE_DIR:-$DEFAULT_STAGE_DIR}"
 
-read -rp "Debounce seconds (wait after changes before syncing) [${DEFAULT_DEBOUNCE_SECONDS}]: " DEBOUNCE_SECONDS
+read -rp "Remote upload destination [${DEFAULT_REMOTE_UPLOAD}]: " REMOTE_UPLOAD
+REMOTE_UPLOAD="${REMOTE_UPLOAD:-$DEFAULT_REMOTE_UPLOAD}"
+
+read -rp "Settle time before upload in seconds [${DEFAULT_SETTLE_SECONDS}]: " SETTLE_SECONDS
+SETTLE_SECONDS="${SETTLE_SECONDS:-$DEFAULT_SETTLE_SECONDS}"
+
+read -rp "Debounce seconds after file events [${DEFAULT_DEBOUNCE_SECONDS}]: " DEBOUNCE_SECONDS
 DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-$DEFAULT_DEBOUNCE_SECONDS}"
-
-read -rp "Transfers (parallel uploads) [${DEFAULT_TRANSFERS}]: " TRANSFERS
-TRANSFERS="${TRANSFERS:-$DEFAULT_TRANSFERS}"
-
-read -rp "Checkers (parallel checks) [${DEFAULT_CHECKERS}]: " CHECKERS
-CHECKERS="${CHECKERS:-$DEFAULT_CHECKERS}"
 
 echo
 echo "==> Creating rclone remote '${REMOTE_NAME}' (type=protondrive)"
@@ -106,110 +99,240 @@ fi
 "${RCLONE_BIN}" "${ARGS[@]}"
 
 echo "==> Testing remote connectivity (rclone lsd ${REMOTE_NAME}: )..."
-"${RCLONE_BIN}" lsd "${REMOTE_NAME}:" || echo "WARN: Remote test failed. Sync may fail until auth/keys are OK."
+"${RCLONE_BIN}" lsd "${REMOTE_NAME}:" || echo "WARN: Remote test failed. Mount/upload may fail until auth/keys are OK."
 
-# -----------------------------
-# 4) Create local working folder
-# -----------------------------
-echo "==> Creating local working folder: ${LOCAL_DIR}"
-mkdir -p "${LOCAL_DIR}"
+# Create dirs
+mkdir -p "${MOUNT_DIR}" "${STAGE_DIR}" "${HOME}/bin" "${HOME}/.config/systemd/user" "${HOME}/.config"
+mkdir -p "${HOME}/.cache"
 
-# -----------------------------
-# 5) Create watcher sync script
-# -----------------------------
-echo "==> Installing watcher script..."
-mkdir -p "${HOME}/bin"
-WATCH_SCRIPT="${HOME}/bin/protondrive-watch-sync.sh"
+# Env for scripts
+ENV_FILE="${HOME}/.config/protondrive-stage.env"
+cat > "${ENV_FILE}" <<EOF
+# Generated by install.sh
+RCLONE_BIN=${RCLONE_BIN}
+REMOTE_NAME=${REMOTE_NAME}
+MOUNT_DIR=${MOUNT_DIR}
+STAGE_DIR=${STAGE_DIR}
+REMOTE_UPLOAD=${REMOTE_UPLOAD}
+SETTLE_SECONDS=${SETTLE_SECONDS}
+DEBOUNCE_SECONDS=${DEBOUNCE_SECONDS}
+TRANSFERS=${DEFAULT_TRANSFERS}
+CHECKERS=${DEFAULT_CHECKERS}
+EOF
 
+# RO mount script
+MOUNT_SCRIPT="${HOME}/bin/protondrive-ro-mount.sh"
+cat > "${MOUNT_SCRIPT}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${HOME}/.config/protondrive-stage.env"
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+
+mkdir -p "${MOUNT_DIR}"
+
+exec "${RCLONE_BIN}" mount "${REMOTE_NAME}:/" "${MOUNT_DIR}" \
+  --read-only \
+  --dir-cache-time 10s \
+  --attr-timeout 10s \
+  --vfs-cache-mode off
+EOF
+chmod +x "${MOUNT_SCRIPT}"
+
+# Uploader script
+UPLOADER_SCRIPT="${HOME}/bin/protondrive-stage-uploader.sh"
+cat > "${UPLOADER_SCRIPT}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${HOME}/.config/protondrive-stage.env"
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+
+LOCK="${HOME}/.cache/protondrive-stage-upload.lock"
+mkdir -p "${HOME}/.cache"
+
+# Upload files that have not changed for SETTLE_SECONDS
+# (prevents uploading half-written temp files / active edits)
+list_candidates() {
+  python3 - <<PY
+import os, time
+stage = os.environ["STAGE_DIR"]
+settle = int(os.environ["SETTLE_SECONDS"])
+now = time.time()
+for root, _, files in os.walk(stage):
+    for fn in files:
+        p = os.path.join(root, fn)
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            continue
+        if (now - st.st_mtime) >= settle and st.st_size >= 0:
+            rel = os.path.relpath(p, stage)
+            # rclone wants forward slashes
+            print(rel.replace(os.sep, "/"))
+PY
+}
+
+run_upload() {
+  # Prevent overlapping runs
+  flock -n "${LOCK}" bash -c '
+    TMP="$(mktemp)"
+    trap "rm -f ${TMP}" EXIT
+
+    mapfile -t FILES < <(list_candidates || true)
+    if [[ ${#FILES[@]} -eq 0 ]]; then
+      exit 0
+    fi
+
+    printf "%s\n" "${FILES[@]}" > "${TMP}"
+
+    echo "==> Uploading ${#FILES[@]} file(s) from staging..."
+
+    "'"${RCLONE_BIN}"'" move "'"${STAGE_DIR}"'" "'"${REMOTE_UPLOAD}"'" \
+      --files-from "'"${TMP}"'" \
+      --delete-empty-src-dirs \
+      --protondrive-replace-existing-draft=true \
+      --transfers "'"${TRANSFERS}"'" \
+      --checkers "'"${CHECKERS}"'" \
+      --retries 10 \
+      --low-level-retries 20 \
+      --retries-sleep 5s \
+      --contimeout 30s \
+      --timeout 5m \
+      --log-level INFO \
+      || true
+  ' || true
+}
+
+# If called without args, do one pass.
+run_upload
+EOF
+chmod +x "${UPLOADER_SCRIPT}"
+
+# Watcher script
+WATCH_SCRIPT="${HOME}/bin/protondrive-stage-watch.sh"
 cat > "${WATCH_SCRIPT}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Values are injected by the installer into an env file read by systemd.
-ENV_FILE="${HOME}/.config/protondrive-sync.env"
-if [[ -f "${ENV_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}"
-else
-  echo "Missing env file: ${ENV_FILE}" >&2
+ENV_FILE="${HOME}/.config/protondrive-stage.env"
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+
+echo "==> Watching staging folder: ${STAGE_DIR}"
+echo "==> Upload destination:     ${REMOTE_UPLOAD}"
+echo "==> Settle time:            ${SETTLE_SECONDS}s"
+echo "==> Debounce:               ${DEBOUNCE_SECONDS}s"
+echo
+
+while true; do
+  inotifywait -r -e close_write,moved_to,create,delete,move "${STAGE_DIR}" >/dev/null 2>&1 || true
+  sleep "${DEBOUNCE_SECONDS}"
+  "${HOME}/bin/protondrive-stage-uploader.sh" || true
+done
+EOF
+chmod +x "${WATCH_SCRIPT}"
+
+# Helper: pd-edit
+PDEDIT="${HOME}/bin/pd-edit"
+cat > "${PDEDIT}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${HOME}/.config/protondrive-stage.env"
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: pd-edit <remote-relative-path>"
+  echo "Example: pd-edit Documents/report.docx"
   exit 1
 fi
 
-echo "==> Watching: ${LOCAL_DIR}"
-echo "==> Syncing to: ${REMOTE_PATH}"
-echo "==> Debounce: ${DEBOUNCE_SECONDS}s"
+REL="$1"
+REL="${REL#/}"
+
+DEST="${STAGE_DIR}/${REL}"
+mkdir -p "$(dirname "${DEST}")"
+
+echo "==> Downloading to staging: ${REL}"
+"${RCLONE_BIN}" copyto "${REMOTE_NAME}:/${REL}" "${DEST}" \
+  --transfers 1 --checkers 1 \
+  --retries 10 --low-level-retries 20 --retries-sleep 5s \
+  --timeout 5m \
+  --log-level INFO
+
+echo "==> Opening: ${DEST}"
+xdg-open "${DEST}" >/dev/null 2>&1 || true
+
 echo
-
-# Main loop: wait for changes, then sync after a quiet period
-while true; do
-  # Wait for any change events; ignore noisy transient errors
-  inotifywait -r -e modify,create,delete,move "${LOCAL_DIR}" >/dev/null 2>&1 || true
-
-  # Debounce window
-  sleep "${DEBOUNCE_SECONDS}"
-
-  # Run sync (local -> remote)
-  "${RCLONE_BIN}" sync "${LOCAL_DIR}" "${REMOTE_PATH}" \
-    --protondrive-replace-existing-draft=true \
-    --transfers "${TRANSFERS}" \
-    --checkers "${CHECKERS}" \
-    --log-level INFO || true
-done
+echo "Note: When you save changes, the watcher will upload the file to:"
+echo "  ${REMOTE_UPLOAD}/${REL}"
+echo "and remove it from staging after a successful upload."
 EOF
+chmod +x "${PDEDIT}"
 
-chmod +x "${WATCH_SCRIPT}"
-
-# Write env file used by the watcher service
-echo "==> Writing environment file..."
-mkdir -p "${HOME}/.config"
-ENV_FILE="${HOME}/.config/protondrive-sync.env"
-cat > "${ENV_FILE}" <<EOF
-# Generated by install.sh
-RCLONE_BIN=${RCLONE_BIN}
-LOCAL_DIR=${LOCAL_DIR}
-REMOTE_PATH=${REMOTE_PATH}
-DEBOUNCE_SECONDS=${DEBOUNCE_SECONDS}
-TRANSFERS=${TRANSFERS}
-CHECKERS=${CHECKERS}
-EOF
-
-# -----------------------------
-# 6) Create systemd user service for watch-sync
-# -----------------------------
-echo "==> Creating systemd --user service..."
-mkdir -p "${HOME}/.config/systemd/user"
-UNIT_FILE="${HOME}/.config/systemd/user/protondrive-watch-sync.service"
-
-cat > "${UNIT_FILE}" <<EOF
+# systemd units
+UNIT_MOUNT="${HOME}/.config/systemd/user/${SERVICE_MOUNT}.service"
+cat > "${UNIT_MOUNT}" <<EOF
 [Unit]
-Description=Proton Drive sync on change (rclone + inotify)
+Description=Proton Drive read-only mount (rclone)
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/bin/protondrive-watch-sync.sh
-Restart=always
+ExecStart=%h/bin/protondrive-ro-mount.sh
+ExecStop=/bin/fusermount3 -u ${MOUNT_DIR}
+Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=default.target
 EOF
 
-echo "==> Enabling and starting the watcher service..."
+UNIT_UPLOADER="${HOME}/.config/systemd/user/${SERVICE_UPLOADER}.service"
+cat > "${UNIT_UPLOADER}" <<EOF
+[Unit]
+Description=Proton Drive staging uploader (watch + rclone move)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/protondrive-stage-watch.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable/start
 systemctl --user daemon-reload
-systemctl --user enable protondrive-watch-sync.service
-systemctl --user restart protondrive-watch-sync.service
+systemctl --user enable "${SERVICE_MOUNT}.service" "${SERVICE_UPLOADER}.service"
+systemctl --user restart "${SERVICE_MOUNT}.service" "${SERVICE_UPLOADER}.service"
 
 echo
-echo "==> Done!"
+echo "==> Installed."
 echo
-echo "Local working folder:"
-echo "  ${LOCAL_DIR}"
+echo "Browse (read-only):"
+echo "  ${MOUNT_DIR}"
 echo
-echo "Service status:"
-echo "  systemctl --user status protondrive-watch-sync"
+echo "Stage edits/uploads here (files are removed after successful upload):"
+echo "  ${STAGE_DIR}"
 echo
-echo "Follow logs:"
-echo "  journalctl --user -u protondrive-watch-sync -f"
+echo "Edit a remote file:"
+echo "  pd-edit <remote-relative-path>"
 echo
-echo "Tip: Work ONLY in the local folder above. Uploads happen via rclone sync after changes."
+echo "Services:"
+echo "  systemctl --user status ${SERVICE_MOUNT} ${SERVICE_UPLOADER}"
+echo
+echo "Logs:"
+echo "  journalctl --user -u ${SERVICE_UPLOADER} -f"
+echo
+echo "Important:"
+echo "  - Do NOT write into the read-only mount."
+echo "  - Uploads land in: ${REMOTE_UPLOAD}"
+echo "  - If Proton Drive reports 'already exists' after a failed upload,"
+echo "    delete that file in Proton Drive web and empty trash, then retry."
